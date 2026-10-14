@@ -1,8 +1,8 @@
 """
 YT Bulk Subtitles Downloader (YTBSD)
-CLI wizard to download subtitles from single videos, playlists, or entire channels.
-Output in markdown format (for LLM RAG) or SRT format (subtitle files).
-Features: Multi-threading, proxy rotation, progress saving, resume capability.
+CLI wizard to download subtitles from single videos, URL lists, playlists, or entire channels.
+Output in Markdown, timestamped SRT, or timestamped plain-text format. Each output file is numbered and identifies its source video URL.
+Features: Bounded multi-threading, direct-first proxy fallback, progress saving, and resume capability.
 """
 
 import json
@@ -103,11 +103,7 @@ def download_fresh_proxies(proxy_file: str = PROXY_FILE) -> int:
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--log-level=3")  # Suppress Chrome logs
-        try:
-            # Prefer Selenium Manager so the driver matches the installed Chrome version.
-            driver = webdriver.Chrome(options=options)
-        except Exception:
-            driver = webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=options)
+        driver = webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=options)
 
         url = "https://free-proxy-list.net/en/"
         driver.get(url)
@@ -145,16 +141,15 @@ def download_fresh_proxies(proxy_file: str = PROXY_FILE) -> int:
 # ============================================================================
 
 # Threading settings (reduced to avoid rate limiting)
-DEFAULT_THREADS = 2
-MAX_THREADS = 1000
+DEFAULT_THREADS = 4
+MAX_THREADS = 16
 MIN_THREADS = 1
-THREAD_DELAY_MIN = 1.5
-THREAD_DELAY_MAX = 3.0
+THREAD_DELAY_MIN = 0.1
+THREAD_DELAY_MAX = 0.3
 
 # Proxy settings
-MAX_PROXY_RETRIES = 20  # Reduced to avoid long waits
+MAX_PROXY_RETRIES = 3  # Keep dead/slow public proxy retries bounded
 PROXY_TIMEOUT = 15  # Timeout for proxy validation
-MAX_PROXY_ATTEMPTS_PER_VIDEO = 100  # Avoid getting stuck on private/members-only videos (Increased if proxy fails)
 
 # Video fetch timeout (seconds) - if a video takes longer, skip it
 VIDEO_FETCH_TIMEOUT = 15
@@ -285,17 +280,13 @@ class ProxyPool:
 
 
 # ============================================================================
-# Video Work Queue (Collaborative Multi-Proxy Download)
+# Video Work Queue (Direct-First Proxy Fallback)
 # ============================================================================
 
 class VideoWorkQueue:
-    """
-    Thread-safe work queue that allows multiple threads to work on the same video
-    with different proxies simultaneously. Implements collaborative work-stealing pattern.
-    """
+    """Thread-safe queue that tries each video's direct connection before proxy fallback."""
 
-    MAX_PROXY_REFRESHES = 3
-    NO_TRANSCRIPT_VOTES_REQUIRED = 2
+    NO_TRANSCRIPT_VOTES_REQUIRED = 1
 
     def __init__(self, videos: list[dict], proxy_pool: ProxyPool, status_callback=None):
         self.videos = {v['id']: v for v in videos}  # Map id -> video dict
@@ -303,17 +294,13 @@ class VideoWorkQueue:
         self.proxy_pool = proxy_pool
         self.status_callback = status_callback
         self.lock = threading.Lock()
-        self.proxy_refresh_count = 0
-        self.refresh_in_progress = False  # Prevent simultaneous refreshes
-
         # Video states: 'pending', 'in_progress', 'completed', 'no_transcript', 'failed'
         self.video_states = {v['id']: 'pending' for v in videos}
 
         # Track which proxies have been tried for each video (per-video, not global)
         self.video_proxy_attempts = {v['id']: set() for v in videos}
-        self.video_attempt_counts = {v['id']: 0 for v in videos}
 
-        # Track "no transcript" votes (need 2 confirmations)
+        # Kept as a small statistic; a no-transcript response is accepted immediately.
         self.no_transcript_votes = {v['id']: 0 for v in videos}
 
         # Track active workers per video
@@ -331,187 +318,60 @@ class VideoWorkQueue:
         # Track total proxy attempts for logging
         self.total_proxy_attempts = 0
 
-    def get_work(self) -> tuple[dict, str] | None:
-        """
-        Get a video and proxy to work on.
+    def get_work(self) -> tuple[dict, str | None] | None:
+        """Assign one attempt per video: direct first, then bounded proxy fallbacks."""
+        while True:
+            should_wait = False
+            with self.lock:
+                with self.proxy_pool.lock:
+                    all_proxies = set(self.proxy_pool.proxies) - set(self.proxy_pool.failed_proxies)
 
-        Strategy:
-        1. First, try to get a 'pending' video (not started by anyone)
-        2. If none, join an 'in_progress' video with a new proxy
-        3. If all proxies tried for all videos, refresh proxy list
-        4. Return None if all videos completed or no proxies left after 3 refreshes
-
-        NOTE: We do NOT globally blacklist proxies. A proxy that fails on video A
-        might work on video B. We only track which proxies have been tried per-video.
-        """
-        should_retry = False
-
-        with self.lock:
-            all_proxies = set(self.proxy_pool.proxies)  # All available proxies
-
-            for vid, state in list(self.video_states.items()):
-                if (state in ('pending', 'in_progress') and
-                        self.video_attempt_counts[vid] >= MAX_PROXY_ATTEMPTS_PER_VIDEO and
-                        self.active_workers[vid] == 0):
-                    self._mark_failed_locked(
-                        vid,
-                        f"Stopped after {MAX_PROXY_ATTEMPTS_PER_VIDEO} proxy attempts"
-                    )
-
-            # Strategy 1: Find a pending video
-            for video in self.video_list:
-                vid = video['id']
-                if self.video_states[vid] == 'pending':
-                    if self.video_attempt_counts[vid] >= MAX_PROXY_ATTEMPTS_PER_VIDEO:
+                # First retry any idle video whose direct attempt failed.
+                for video in self.video_list:
+                    vid = video['id']
+                    if self.video_states[vid] != 'in_progress' or self.active_workers[vid] > 0:
                         continue
-                    # Get a random proxy not yet tried for this video
-                    available = all_proxies - self.video_proxy_attempts[vid]
-                    if available:
+
+                    attempted_proxies = {p for p in self.video_proxy_attempts[vid] if p is not None}
+                    available = all_proxies - attempted_proxies
+                    if len(attempted_proxies) < MAX_PROXY_RETRIES and available:
                         proxy = random.choice(list(available))
-                        self.video_states[vid] = 'in_progress'
                         self.video_proxy_attempts[vid].add(proxy)
-                        self.video_attempt_counts[vid] += 1
                         self.active_workers[vid] += 1
                         self.total_proxy_attempts += 1
                         return (video, proxy)
 
-            # Strategy 2: Join an in_progress video with a different proxy
-            # Prefer videos with fewer active workers AND fewer attempted proxies
-            in_progress = []
-            for vid, state in self.video_states.items():
-                if state == 'in_progress':
-                    if self.video_attempt_counts[vid] >= MAX_PROXY_ATTEMPTS_PER_VIDEO:
-                        continue
-                    available_count = len(all_proxies - self.video_proxy_attempts[vid])
-                    if available_count > 0:
-                        in_progress.append((vid, self.active_workers[vid], available_count))
+                    # No usable proxy remains or the per-video retry limit was reached.
+                    self.video_states[vid] = 'failed'
+                    self.failed_count += 1
+                    self.completed_count += 1
 
-            # Sort by: fewest workers first, then most available proxies
-            in_progress.sort(key=lambda x: (x[1], -x[2]))
+                # Then start new videos with a direct attempt; no proxy is used unless direct fails.
+                for video in self.video_list:
+                    vid = video['id']
+                    if self.video_states[vid] == 'pending':
+                        self.video_states[vid] = 'in_progress'
+                        self.video_proxy_attempts[vid].add(None)  # None represents direct connection.
+                        self.active_workers[vid] += 1
+                        return (video, None)
 
-            for vid, _, _ in in_progress:
-                available = all_proxies - self.video_proxy_attempts[vid]
-                if available:
-                    proxy = random.choice(list(available))
-                    self.video_proxy_attempts[vid].add(proxy)
-                    self.video_attempt_counts[vid] += 1
-                    self.active_workers[vid] += 1
-                    self.total_proxy_attempts += 1
-                    return (self.videos[vid], proxy)
-
-            # Strategy 3: Check if we need to refresh proxies
-            # All in-progress videos have exhausted all proxies
-            pending_or_in_progress = [vid for vid, state in self.video_states.items()
-                                       if state in ('pending', 'in_progress')]
-
-            if not pending_or_in_progress:
-                # All videos completed/failed/no_transcript
-                return None
-
-            # Check if ANY video still has untried proxies
-            any_available = False
-            for vid in pending_or_in_progress:
-                if (self.video_attempt_counts[vid] < MAX_PROXY_ATTEMPTS_PER_VIDEO and
-                        len(all_proxies - self.video_proxy_attempts[vid]) > 0):
-                    any_available = True
-                    break
-
-            any_active = any(self.active_workers[vid] > 0 for vid in pending_or_in_progress)
-
-            if any_available:
-                # Shouldn't reach here, but retry just in case
-                should_retry = True
-            elif any_active:
-                # In-flight workers may finish and finalize capped videos.
-                self.lock.release()
-                time.sleep(0.5)
-                self.lock.acquire()
-                should_retry = True
-            elif self.refresh_in_progress:
-                # Another thread is refreshing, wait and retry
-                self.lock.release()
-                time.sleep(0.5)
-                self.lock.acquire()
-                should_retry = True
-            else:
-                # All proxies exhausted for all remaining videos - try to refresh
-                if self._refresh_proxies_internal():
-                    # Proxies refreshed successfully
-                    should_retry = True
-                else:
-                    # Max refreshes reached - mark remaining as failed
-                    for vid in pending_or_in_progress:
-                        if self.video_states[vid] not in ('completed', 'no_transcript'):
-                            self._mark_failed_locked(
-                                vid,
-                                f"Failed after {self.proxy_refresh_count} proxy refresh cycles"
-                            )
+                remaining = [vid for vid, state in self.video_states.items()
+                             if state in ('pending', 'in_progress')]
+                if not remaining:
                     return None
 
-        # Retry after refresh (outside lock)
-        if should_retry:
-            # Check if all work was completed while we were waiting
-            if self.is_all_work_done():
-                return None
-            return self.get_work()
+                if any(self.active_workers[vid] > 0 for vid in remaining):
+                    should_wait = True
+                else:
+                    # Nothing is actively running and no attempts remain; close the queue.
+                    for vid in remaining:
+                        self.video_states[vid] = 'failed'
+                        self.failed_count += 1
+                        self.completed_count += 1
+                    return None
 
-        return None
-
-    def _refresh_proxies_internal(self) -> bool:
-        """
-        Download fresh proxy list. Returns True if successful.
-        Must be called with lock held.
-        """
-        if self.proxy_refresh_count >= self.MAX_PROXY_REFRESHES:
-            return False
-
-        if self.refresh_in_progress:
-            return False  # Another thread is already refreshing
-
-        self.refresh_in_progress = True
-        self.proxy_refresh_count += 1
-        refresh_num = self.proxy_refresh_count
-
-        if self.status_callback:
-            self.status_callback(f"Refreshing proxy list (attempt {refresh_num}/{self.MAX_PROXY_REFRESHES})...")
-
-        # Release lock during download (I/O operation)
-        self.lock.release()
-        try:
-            print(f"\n*** Refreshing proxy list (attempt {refresh_num}/{self.MAX_PROXY_REFRESHES}) ***")
-            count = download_fresh_proxies(PROXY_FILE)
-        finally:
-            self.lock.acquire()
-            self.refresh_in_progress = False
-
-        if count > 0:
-            self.proxy_pool.reload_proxies(PROXY_FILE)
-            # Clear per-video proxy attempts so new proxies can be tried
-            for vid in self.video_proxy_attempts:
-                self.video_proxy_attempts[vid].clear()
-            if self.status_callback:
-                self.status_callback(f"Loaded {count} fresh proxies")
-            print(f"*** Loaded {count} fresh proxies, cleared per-video attempt history ***")
-            return True
-
-        return False
-
-    def _mark_failed_locked(self, video_id: str, error_detail: str):
-        """Mark a video as failed. Must be called with lock held."""
-        if self.video_states[video_id] in ('completed', 'no_transcript', 'failed'):
-            return
-
-        self.video_states[video_id] = 'failed'
-        self.results[video_id] = {
-            'id': video_id,
-            'title': self.videos[video_id]['title'],
-            'transcript': None,
-            'language': None,
-            'method': 'failed',
-            'error_detail': error_detail
-        }
-        self.failed_count += 1
-        self.completed_count += 1
+            if should_wait:
+                time.sleep(0.15)
 
     def mark_completed(self, video_id: str, result: dict):
         """Mark video as successfully completed."""
@@ -523,10 +383,8 @@ class VideoWorkQueue:
                 self.success_count += 1
 
     def mark_no_transcript(self, video_id: str, result: dict):
-        """
-        Vote that video has no transcript.
-        After 2 votes from different proxies, mark as definitively no transcript.
-        """
+        """Mark a video as having no transcript; avoid slow redundant confirmation attempts."""
+
         with self.lock:
             if self.video_states[video_id] in ('completed', 'no_transcript', 'failed'):
                 return  # Already finalized
@@ -540,14 +398,9 @@ class VideoWorkQueue:
                 self.no_transcript_count += 1
 
     def mark_proxy_failed(self, video_id: str, proxy: str):
-        """
-        Note: We intentionally do NOT globally blacklist proxies.
-        A proxy that fails on video A might work on video B.
-        The per-video tracking in video_proxy_attempts is sufficient.
-        This method exists for interface compatibility.
-        """
-        # Don't globally blacklist - proxy might work for other videos
-        pass
+        """Globally skip a proxy after it fails, to avoid retrying the same dead server."""
+        if proxy:
+            self.proxy_pool.mark_failed(proxy)
 
     def is_video_done(self, video_id: str) -> bool:
         """Check if video was completed/no_transcript/failed by another thread."""
@@ -583,10 +436,11 @@ class VideoWorkQueue:
                     results.append({
                         'id': vid,
                         'title': video['title'],
+                        'url': get_video_source_url(video),
                         'transcript': None,
                         'language': None,
                         'method': 'failed',
-                        'error_detail': f"Failed after {self.proxy_refresh_count} proxy refresh cycles"
+                        'error_detail': 'Direct connection and available proxy fallbacks failed or were unavailable'
                     })
             return results
 
@@ -597,22 +451,125 @@ class VideoWorkQueue:
 
 def sanitize_filename(name: str) -> str:
     """Remove invalid characters from filename."""
-    sanitized = re.sub(r'[<>:"/\\|?*]', '', name)
+    sanitized = re.sub(r'[<>:"/\\|?*]', '', str(name or ''))
     sanitized = re.sub(r'\s+', ' ', sanitized).strip()
     return sanitized[:100] if len(sanitized) > 100 else sanitized
 
 
 def extract_video_id(url: str) -> str:
-    """Extract video ID from various YouTube URL formats."""
+    """Extract a YouTube video ID from common URL forms or a bare video ID."""
+    url = url.strip().strip('"').strip("'")
     patterns = [
-        r'(?:v=|/v/|/live/|youtu\.be/)([a-zA-Z0-9_-]{11})',
-        r'^([a-zA-Z0-9_-]{11})$'
+        r'(?:youtu\.be/)([a-zA-Z0-9_-]{11})(?:[?&#/]|$)',
+        r'(?:youtube\.com|youtube-nocookie\.com)/(?:.*?/)?(?:shorts|embed|live|v)/([a-zA-Z0-9_-]{11})(?:[?&#/]|$)',
+        r'[?&]v=([a-zA-Z0-9_-]{11})(?:[&#]|$)',
+        r'^([a-zA-Z0-9_-]{11})$',
     ]
     for pattern in patterns:
         match = re.search(pattern, url)
         if match:
             return match.group(1)
     return url
+
+
+def video_page_url(candidate_url: str = None, video_id: str = None) -> str:
+    """Return the supplied video URL when it matches the ID, otherwise a canonical URL."""
+    video_id = str(video_id or '').strip()
+    candidate = str(candidate_url or '').strip()
+    if candidate.startswith(('https://', 'http://')) and video_id:
+        try:
+            if extract_video_id(candidate) == video_id:
+                return candidate
+        except Exception:
+            pass
+    if not video_id and candidate:
+        extracted = extract_video_id(candidate)
+        if re.fullmatch(r'[A-Za-z0-9_-]{11}', extracted):
+            video_id = extracted
+    return f"https://www.youtube.com/watch?v={video_id}" if video_id else (candidate or 'Unknown source URL')
+
+
+def get_video_source_url(video: dict) -> str:
+    """Get a video's source URL, including for progress data saved by older versions."""
+    return video_page_url(
+        video.get('url') or video.get('webpage_url'),
+        video.get('id')
+    )
+
+
+def make_numbered_filepath(directory: str, sequence_number: int, title: str,
+                           extension: str, title_counts: dict = None) -> str:
+    """Build a numbered output path and avoid title collisions or overwriting files."""
+    os.makedirs(directory, exist_ok=True)
+    title_counts = title_counts if title_counts is not None else {}
+    safe_title = sanitize_filename(title) or 'video'
+    title_key = safe_title.casefold()
+    occurrence = title_counts.get(title_key, 0) + 1
+    title_counts[title_key] = occurrence
+
+    suffix_number = occurrence
+    while True:
+        duplicate_suffix = f" ({suffix_number})" if suffix_number > 1 else ''
+        filename = f"{sequence_number:02d}- {safe_title}{duplicate_suffix}.{extension.lstrip('.')}"
+        filepath = os.path.join(directory, filename)
+        if not os.path.exists(filepath):
+            # If an older run already occupied this name, keep later same-title
+            # files' suffixes increasing as well (e.g. (2), then (3)).
+            title_counts[title_key] = max(title_counts.get(title_key, occurrence), suffix_number)
+            return filepath
+        suffix_number += 1
+
+
+def source_header(video: dict) -> str:
+    """Format the required first-line source marker for an individual video."""
+    return f"Source video: {get_video_source_url(video)}"
+
+
+def serialize_subtitle_segments(fetched_transcript) -> list[dict]:
+    """Convert API transcript snippets into JSON-safe timestamped segment records."""
+    segments = []
+    for snippet in fetched_transcript:
+        segments.append({
+            "text": str(getattr(snippet, "text", "")),
+            "start": float(getattr(snippet, "start", 0.0) or 0.0),
+            "duration": float(getattr(snippet, "duration", 0.0) or 0.0),
+        })
+    return segments
+
+
+def format_srt_timestamp(seconds: float) -> str:
+    """Format seconds as the SRT timestamp form HH:MM:SS,mmm."""
+    milliseconds = max(0, int(round(float(seconds) * 1000)))
+    hours, remainder = divmod(milliseconds, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    whole_seconds, milliseconds = divmod(remainder, 1000)
+    return f"{hours:02d}:{minutes:02d}:{whole_seconds:02d},{milliseconds:03d}"
+
+
+def format_timestamped_subtitles(video: dict, formatter=None) -> str:
+    """Get SRT cue content from a live transcript or saved timestamp segments."""
+    fetched = video.get("fetched_transcript")
+    if fetched is not None:
+        formatter = formatter or SRTFormatter()
+        return formatter.format_transcript(fetched).strip()
+
+    segments = video.get("subtitle_segments") or []
+    if not segments:
+        return ""
+
+    lines = []
+    for index, segment in enumerate(segments, start=1):
+        start = float(segment.get("start", 0.0) or 0.0)
+        duration = max(0.0, float(segment.get("duration", 0.0) or 0.0))
+        end = start + duration
+        text = str(segment.get("text", "")).replace("\r\n", "\n").replace("\r", "\n")
+        lines.extend([
+            str(index),
+            f"{format_srt_timestamp(start)} --> {format_srt_timestamp(end)}",
+            text,
+            "",
+        ])
+    return "\n".join(lines).strip()
 
 
 def extract_video_info_with_timeout(url: str, ydl_opts: dict, timeout: int = VIDEO_INFO_TIMEOUT):
@@ -639,7 +596,7 @@ def extract_video_info_with_timeout(url: str, ydl_opts: dict, timeout: int = VID
         raise
 
 
-def get_video_ids_from_url(url: str, mode: str, proxy_pool: ProxyPool = None) -> tuple[list[dict], str, str]:
+def get_video_ids_from_url(url: str, mode: str, proxy_pool: ProxyPool = None, success_pause: float = 0.5) -> tuple[list[dict], str, str]:
     """Extract video information from URL using yt-dlp with proxy support.
     Tries direct connection first, then falls back to proxies if needed."""
     console = Console()
@@ -648,7 +605,7 @@ def get_video_ids_from_url(url: str, mode: str, proxy_pool: ProxyPool = None) ->
     source_type = mode
     
     use_proxies = proxy_pool is not None and proxy_pool.has_proxies()
-    max_proxy_attempts = 200 if use_proxies else 0
+    max_proxy_attempts = min(MAX_PROXY_RETRIES, len(proxy_pool.proxies)) if use_proxies else 0
     
     # Create a status text that will update in place
     status_text = Text("Fetching video info...", style="yellow")
@@ -668,7 +625,7 @@ def get_video_ids_from_url(url: str, mode: str, proxy_pool: ProxyPool = None) ->
             info = extract_video_info_with_timeout(url, ydl_opts, timeout=VIDEO_INFO_TIMEOUT)
 
             if mode == "single":
-                videos = [{'id': info.get('id'), 'title': info.get('title', 'Unknown')}]
+                videos = [{'id': info.get('id'), 'title': info.get('title', 'Unknown'), 'url': video_page_url(url, info.get('id'))}]
                 source_name = sanitize_filename(info.get('title', 'video'))
             else:
                 source_name = sanitize_filename(info.get('title', info.get('uploader', 'unknown')))
@@ -676,14 +633,16 @@ def get_video_ids_from_url(url: str, mode: str, proxy_pool: ProxyPool = None) ->
 
                 for entry in entries:
                     if entry:
+                        entry_id = entry.get('id') or extract_video_id(entry.get('url', ''))
                         videos.append({
-                            'id': entry.get('id'),
-                            'title': entry.get('title', 'Unknown')
+                            'id': entry_id,
+                            'title': entry.get('title', 'Unknown'),
+                            'url': video_page_url(entry.get('webpage_url') or entry.get('url'), entry_id)
                         })
 
             # Success with direct connection
             status_text.plain = "✓ Successfully fetched (direct connection)"
-            time.sleep(0.5)  # Brief pause to show success message
+            time.sleep(success_pause)  # Brief pause to show success message
             return videos, source_name, source_type
             
         except (TimeoutError, Exception) as e:
@@ -723,7 +682,7 @@ def get_video_ids_from_url(url: str, mode: str, proxy_pool: ProxyPool = None) ->
                 info = extract_video_info_with_timeout(url, ydl_opts, timeout=VIDEO_INFO_TIMEOUT)
 
                 if mode == "single":
-                    videos = [{'id': info.get('id'), 'title': info.get('title', 'Unknown')}]
+                    videos = [{'id': info.get('id'), 'title': info.get('title', 'Unknown'), 'url': video_page_url(url, info.get('id'))}]
                     source_name = sanitize_filename(info.get('title', 'video'))
                 else:
                     source_name = sanitize_filename(info.get('title', info.get('uploader', 'unknown')))
@@ -731,14 +690,16 @@ def get_video_ids_from_url(url: str, mode: str, proxy_pool: ProxyPool = None) ->
 
                     for entry in entries:
                         if entry:
+                            entry_id = entry.get('id') or extract_video_id(entry.get('url', ''))
                             videos.append({
-                                'id': entry.get('id'),
-                                'title': entry.get('title', 'Unknown')
+                                'id': entry_id,
+                                'title': entry.get('title', 'Unknown'),
+                                'url': video_page_url(entry.get('webpage_url') or entry.get('url'), entry_id)
                             })
 
                 # Success with proxy
                 status_text.plain = f"✓ Successfully fetched via proxy: {proxy_ip}"
-                time.sleep(0.5)  # Brief pause to show success message
+                time.sleep(success_pause)  # Brief pause to show success message
                 return videos, source_name, source_type
                 
             except TimeoutError:
@@ -859,9 +820,15 @@ def clear_progress():
 # ============================================================================
 
 def create_markdown_output(videos_data: list[dict], source_name: str, source_type: str) -> str:
-    """Create markdown formatted output optimized for LLM RAG."""
+    """Create markdown output with source URLs at the file start and each video section."""
     lines = []
 
+    # Required file-level first line: identify the first source video.
+    if videos_data:
+        lines.append(source_header(videos_data[0]))
+    else:
+        lines.append("Source video: Unknown source URL")
+    lines.append("")
     lines.append(f"# {source_name}")
     lines.append("")
     lines.append(f"**Source Type:** {source_type.title()}")
@@ -885,10 +852,12 @@ def create_markdown_output(videos_data: list[dict], source_name: str, source_typ
     lines.append("")
 
     for i, video in enumerate(videos_data, 1):
+        # Keep the source URL directly above every video's transcript section.
+        lines.append(source_header(video))
+        lines.append("")
         lines.append(f"## {i}. {video['title']}")
         lines.append("")
         lines.append(f"**Video ID:** {video['id']}")
-        lines.append(f"**URL:** https://www.youtube.com/watch?v={video['id']}")
         if video.get('language'):
             lines.append(f"**Transcript Language:** {video['language']}")
         lines.append("")
@@ -955,40 +924,130 @@ def create_split_markdown_output(videos_data: list[dict], source_name: str,
     return files
 
 
-def create_srt_output(videos_data: list[dict], source_name: str, output_dir: str) -> list[str]:
+def create_srt_output(videos_data: list[dict], source_name: str, output_dir: str,
+                      export_failed_ids: set = None) -> list[str]:
+    """Create one numbered timestamped SRT file per video, with its URL on line one.
+
+    `export_failed_ids` is populated for transcript records that exist but could not
+    be exported to SRT, so the final failure report can include them.
     """
-    Create SRT files for each video with transcripts.
-    Creates a folder with channel/playlist name and saves each video as separate .srt file.
-    Returns list of created file paths.
-    """
+    export_failed_ids = export_failed_ids if export_failed_ids is not None else set()
     formatter = SRTFormatter()
     filepaths = []
-
-    # Create folder with source name
-    folder_name = sanitize_filename(source_name)
+    folder_name = sanitize_filename(source_name) or 'subtitles'
     srt_dir = os.path.join(output_dir, folder_name)
     os.makedirs(srt_dir, exist_ok=True)
+    title_counts = {}
+    output_number = 0
 
     for video in videos_data:
-        # Skip videos without transcripts or without raw data
-        if not video.get('fetched_transcript'):
+        if not video.get('transcript'):
             continue
 
-        # Create filename from video title
-        video_title = sanitize_filename(video['title'])
-        filename = f"{video_title}.srt"
-        filepath = os.path.join(srt_dir, filename)
-
-        # Format transcript as SRT
         try:
-            srt_content = formatter.format_transcript(video['fetched_transcript'])
-            with open(filepath, 'w', encoding='utf-8') as f:
-                f.write(srt_content)
+            srt_content = format_timestamped_subtitles(video, formatter=formatter)
+            if not srt_content:
+                print(f"Warning: Timestamps unavailable for '{video.get('title', 'video')}'; skipping SRT export.")
+                export_failed_ids.add(video.get('id'))
+                continue
+            next_output_number = output_number + 1
+            filepath = make_numbered_filepath(
+                srt_dir, next_output_number, video.get('title', 'video'), 'srt', title_counts
+            )
+            # URL header is included per requirement; some subtitle players may reject this metadata line.
+            with open(filepath, 'w', encoding='utf-8', newline='') as f:
+                f.write(source_header(video) + '\n\n' + srt_content + '\n')
+            output_number = next_output_number
             filepaths.append(filepath)
         except Exception as e:
-            print(f"Warning: Could not create SRT for '{video['title']}': {e}")
+            export_failed_ids.add(video.get('id'))
+            print(f"Warning: Could not create SRT for '{video.get('title', 'video')}': {e}")
 
     return filepaths
+
+
+def create_text_output(videos_data: list[dict], source_name: str, output_dir: str,
+                       export_failed_ids: set = None) -> list[str]:
+    """Create one numbered .txt per video using the same timestamped cues as SRT.
+
+    `export_failed_ids` is populated for transcript records that exist but could not
+    be exported to timestamped TXT, so the final failure report can include them.
+    """
+    export_failed_ids = export_failed_ids if export_failed_ids is not None else set()
+    formatter = SRTFormatter()
+    filepaths = []
+    folder_name = sanitize_filename(source_name) or 'subtitles'
+    text_dir = os.path.join(output_dir, folder_name)
+    os.makedirs(text_dir, exist_ok=True)
+    title_counts = {}
+    output_number = 0
+
+    for video in videos_data:
+        if not video.get('transcript'):
+            continue
+
+        try:
+            timestamped_content = format_timestamped_subtitles(video, formatter=formatter)
+            if not timestamped_content:
+                # Older saved progress files did not preserve timestamps. Do not invent timing.
+                print(f"Warning: Timestamps unavailable for saved transcript '{video.get('title', 'video')}'; skipping TXT export. Re-download this video to export timestamped TXT.")
+                export_failed_ids.add(video.get('id'))
+                continue
+            next_output_number = output_number + 1
+            filepath = make_numbered_filepath(
+                text_dir, next_output_number, video.get('title', 'video'), 'txt', title_counts
+            )
+            with open(filepath, 'w', encoding='utf-8', newline='') as f:
+                f.write(source_header(video) + '\n\n' + timestamped_content + '\n')
+            output_number = next_output_number
+            filepaths.append(filepath)
+        except Exception as e:
+            export_failed_ids.add(video.get('id'))
+            print(f"Warning: Could not create TXT for '{video.get('title', 'video')}': {e}")
+
+    return filepaths
+
+
+def create_failed_download_report(videos_data: list[dict], output_folder: str,
+                                  export_failed_ids: set = None) -> tuple[str, int]:
+    """Write a 00-prefixed report listing videos whose subtitles were not exported.
+
+    Each failed entry is written as exactly three lines: YouTube title, source URL,
+    then a blank line. If nothing failed, the report says so explicitly. The report
+    is refreshed for each run, rather than given a collision suffix like subtitle files.
+    """
+    export_failed_ids = export_failed_ids if export_failed_ids is not None else set()
+    os.makedirs(output_folder, exist_ok=True)
+
+    failures = []
+    seen = set()
+    for video in videos_data:
+        video_id = video.get('id')
+        source_url = get_video_source_url(video)
+        has_transcript = bool(video.get('transcript'))
+        export_failed = video_id in export_failed_ids
+        if has_transcript and not export_failed:
+            continue
+
+        identity = str(video_id or source_url)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        failures.append((str(video.get('title') or 'Unknown video title'), source_url))
+
+    report_path = os.path.join(output_folder, '00-failed-downloads.txt')
+    if failures:
+        lines = []
+        for title, source_url in failures:
+            lines.extend([title, source_url, ''])
+        report_text = '\n'.join(lines) + '\n'
+    else:
+        report_text = 'No failed downloads.\n'
+
+    with open(report_path, 'w', encoding='utf-8', newline='') as f:
+        f.write(report_text)
+
+    return report_path, len(failures)
 
 
 # ============================================================================
@@ -1153,14 +1212,14 @@ def download_single_video_with_proxy(video: dict, proxy: str, status_callback=No
     Try to download a video transcript using ONE specific proxy.
     Returns result dict with success/failure info.
 
-    This is used by the collaborative work queue where each thread
-    tries a different proxy for the same video.
+    This is used by the direct-first work queue for a single active attempt per video.
     """
     video_id = video['id']
     video_title = video['title']
     result_data = {
         'id': video_id,
         'title': video_title,
+        'url': get_video_source_url(video),
         'transcript': None,
         'language': None,
         'method': None,
@@ -1201,6 +1260,7 @@ def download_single_video_with_proxy(video: dict, proxy: str, status_callback=No
             # Success!
             result_data['transcript'] = text
             result_data['fetched_transcript'] = fetched_transcript  # Raw data for SRT
+            result_data['subtitle_segments'] = serialize_subtitle_segments(fetched_transcript)
             result_data['language'] = lang_info
             result_data['method'] = strategy_name.lower()
             return result_data
@@ -1218,117 +1278,67 @@ def download_single_video_with_proxy(video: dict, proxy: str, status_callback=No
 
 
 def download_single_video(video: dict, proxy_pool: ProxyPool, status_callback=None, debug: bool = False) -> dict:
-    """
-    Download transcript for a single video using smart proxy rotation.
-
-    Strategy:
-    1. Try direct connection first (check + download).
-    2. If direct fails (network/geo block), rotate through proxies.
-    3. Ensure the SAME proxy is used for both checking and downloading.
-
-    NOTE: This function is kept for backward compatibility.
-    The new collaborative system uses download_single_video_with_proxy instead.
-    """
+    """Download one transcript directly first, then try at most MAX_PROXY_RETRIES proxies."""
     video_id = video['id']
     video_title = video['title']
     result_data = {
         'id': video_id,
         'title': video_title,
+        'url': get_video_source_url(video),
         'transcript': None,
         'language': None,
         'method': None,
         'error_detail': None
     }
 
-    # Strategy list: If proxies exist, use them immediately and skip direct connection
-    # This prevents blocking on IP bans/timeouts when user knows they are blocked
-    use_proxies_only = proxy_pool.has_proxies()
-    
-    max_proxy_attempts = 20
+    max_proxy_attempts = min(MAX_PROXY_RETRIES, len(proxy_pool.proxies))
     attempts_made = 0
-    
-    # If using proxies, we loop through them. If not, we try Direct once.
-    # Increased to 50 to handle lists with many dead proxies
-    total_attempts = 200 if use_proxies_only else 1
+    total_attempts = 1 + max_proxy_attempts  # One direct attempt plus bounded proxy fallbacks.
 
     while attempts_made < total_attempts:
         current_proxy = None
         strategy_name = "Direct"
-
-        if use_proxies_only:
+        if attempts_made > 0:
             current_proxy = proxy_pool.get_proxy()
             if not current_proxy:
                 break
             strategy_name = f"Proxy:{current_proxy.split(':')[0]}"
-        elif attempts_made > 0:
-             # Should not happen if use_proxies_only is False (max attempts = 1)
-             break
 
-        # Update status for progress tracking
         proxy_ip = current_proxy.split(':')[0] if current_proxy else "Direct"
         if status_callback:
-            status_callback(f"Attempt {attempts_made+1}: Checking via {proxy_ip}...")
+            status_callback(f"Attempt {attempts_made + 1}: Checking via {proxy_ip}...")
 
         try:
-            # --- Step 1: Check Availability ---
-            # We use a timeout for availability checks to fail fast on bad proxies
-            try:
-                # Use query-based check with timeout (supports both direct and proxy)
-                transcript_obj, lang_info = check_availability_with_timeout(video_id, proxy=current_proxy, timeout=AVAILABILITY_CHECK_TIMEOUT)
-                if status_callback:
-                    status_callback(f"✓ Transcript found: {lang_info}")
-
-                    
-            except TimeoutError:
-                raise Exception("Availability check timed out")
-            except NoTranscriptError:
-                # This is definitive - no transcript exists. Don't retry with other proxies.
-                result_data['method'] = "no_transcript"
-                if status_callback:
-                    status_callback("No transcript available")
-                return result_data
-            
-            # --- Step 2: Download Content ---
-            try:
-                # Fetch content with timeout protection
-                if status_callback:
-                    status_callback("Downloading transcript content...")
-                text, fetched_transcript = fetch_content_with_timeout(transcript_obj, timeout=VIDEO_FETCH_TIMEOUT)
-                if status_callback:
-                    status_callback(f"✓ Downloaded ({len(text)} chars) via {proxy_ip}")
-
-                # Success!
-                result_data['transcript'] = text
-                result_data['fetched_transcript'] = fetched_transcript  # Raw data for SRT
-                result_data['language'] = lang_info
-                result_data['method'] = strategy_name.lower()
-                return result_data
-
-            except Exception as e:
-                raise Exception(f"Download failed: {e}")
-
+            transcript_obj, lang_info = check_availability_with_timeout(
+                video_id, proxy=current_proxy, timeout=AVAILABILITY_CHECK_TIMEOUT
+            )
+            text, fetched_transcript = fetch_content_with_timeout(
+                transcript_obj, timeout=VIDEO_FETCH_TIMEOUT
+            )
+            result_data['transcript'] = text
+            result_data['fetched_transcript'] = fetched_transcript
+            result_data['subtitle_segments'] = serialize_subtitle_segments(fetched_transcript)
+            result_data['language'] = lang_info
+            result_data['method'] = strategy_name.lower()
+            return result_data
+        except NoTranscriptError:
+            result_data['method'] = "no_transcript"
+            if status_callback:
+                status_callback("No transcript available")
+            return result_data
         except Exception as e:
-            # If it's a proxy error, mark it failed
             if current_proxy:
                 proxy_pool.mark_failed(current_proxy)
-            
-            error_msg = str(e)
+            result_data['error_detail'] = f"{strategy_name} error: {str(e).splitlines()[0][:160]}"
             if status_callback:
-                status_callback(f"✗ Failed via {proxy_ip}: {error_msg[:50]}")
-            
-            # Keep the error detail from the last attempt
-            result_data['error_detail'] = f"{strategy_name} error: {error_msg}"
-            
+                status_callback(f"Failed via {proxy_ip}; trying fallback if available")
         attempts_made += 1
 
-    # If we get here, all attempts failed
     result_data['method'] = "error"
     if not result_data['error_detail']:
-        result_data['error_detail'] = "All connection attempts exhausted"
+        result_data['error_detail'] = "Direct connection and available proxy fallbacks failed or were unavailable"
     else:
-        # Prepend attempt count to clarify it wasn't just one try
         result_data['error_detail'] = f"Failed after {attempts_made} attempts. Last: {result_data['error_detail']}"
-        
     return result_data
 
 
@@ -1337,13 +1347,10 @@ def download_transcripts_parallel(videos: list[dict], source_name: str, source_t
                                    start_index: int = 0, existing_data: list[dict] = None,
                                    completed_ids: set = None, output_config: dict = None):
     """
-    Download transcripts in parallel using collaborative multi-proxy pattern.
+    Download transcripts in parallel using direct-first requests and bounded proxy fallbacks.
 
-    Key features:
-    - Multiple threads can work on the SAME video with DIFFERENT proxies
-    - When any thread completes a video, others working on it move on
-    - Failed proxies are blacklisted globally
-    - Auto-refreshes proxy list when all proxies exhausted (up to 3 times)
+    Each video gets one active attempt at a time. Failed proxies are skipped for the
+    rest of the run, and public proxies are never auto-scraped during a download.
     """
     videos_data = existing_data if existing_data else []
     completed_ids = completed_ids if completed_ids else set(v['id'] for v in videos_data)
@@ -1360,22 +1367,10 @@ def download_transcripts_parallel(videos: list[dict], source_name: str, source_t
     # Initialize proxy pool
     proxy_pool = ProxyPool(PROXY_FILE, validate=False)
 
-    if not proxy_pool.has_proxies():
-        return download_transcripts_direct_parallel(
-            videos, source_name, source_type, num_threads,
-            existing_data=videos_data,
-            completed_ids=completed_ids,
-            output_config=output_config
-        )
-
-    # NOTE: We no longer cap threads to remaining videos!
-    # Multiple threads can now collaborate on the same video with different proxies
-    print(f"\nDownloading transcripts for {total} video(s) [Collaborative Multi-Proxy Mode]")
+    print(f"\nDownloading transcripts for {total} video(s) [Direct-first Parallel Mode]")
     print(f"Already completed: {len(completed_ids)}, Remaining: {len(remaining_videos)}")
-    print(f"Using {num_threads} threads (can collaborate on same video)")
-    print(f"Loaded {len(proxy_pool.proxies)} proxies, auto-refresh enabled (up to 3x)")
-    print(f"Max proxy attempts per video: {MAX_PROXY_ATTEMPTS_PER_VIDEO}")
-    print("Press Ctrl+C to finish with current results.")
+    print(f"Using {num_threads} worker threads (one active attempt per video)")
+    print(f"Loaded {len(proxy_pool.proxies)} saved proxies; direct first, max {MAX_PROXY_RETRIES} proxy retries per video")
     print("-" * 60)
 
     # Initialize thread status manager
@@ -1387,7 +1382,7 @@ def download_transcripts_parallel(videos: list[dict], source_name: str, source_t
     already_failed = len(videos_data) - already_success - already_no_transcript
     status_manager.update_progress(len(completed_ids), already_success, already_failed, already_no_transcript)
 
-    # Create work queue for collaborative downloading
+    # Create the direct-first work queue
     work_queue = VideoWorkQueue(remaining_videos, proxy_pool)
 
     results_lock = threading.Lock()
@@ -1420,7 +1415,7 @@ def download_transcripts_parallel(videos: list[dict], source_name: str, source_t
                 continue
 
             title_short = video['title'][:35] + "..." if len(video['title']) > 35 else video['title']
-            proxy_ip = proxy.split(':')[0]
+            proxy_ip = proxy.split(':')[0] if proxy else "Direct"
 
             # Create status callback
             def update_status(msg):
@@ -1428,10 +1423,11 @@ def download_transcripts_parallel(videos: list[dict], source_name: str, source_t
 
             update_status(f"Trying {proxy_ip}...")
 
-            # Small random delay to spread out requests
-            time.sleep(random.uniform(0.5, 1.5))
+            # Keep direct requests immediate; lightly stagger only proxy attempts.
+            if proxy:
+                time.sleep(random.uniform(THREAD_DELAY_MIN, THREAD_DELAY_MAX))
 
-            # Try to download with this specific proxy
+            # Try to download directly first, then with this specific proxy
             result = download_single_video_with_proxy(video, proxy, status_callback=update_status)
 
             # Check again if another thread completed while we were working
@@ -1447,12 +1443,9 @@ def download_transcripts_parallel(videos: list[dict], source_name: str, source_t
                 method_short = result.get('method', 'unknown').split(':')[-1]
                 status_manager.update_status(thread_slot, f"✓ OK ({result['language']}) via {method_short}")
             elif result['method'] == 'no_transcript':
-                # Vote for no transcript (needs 2 confirmations)
+                # Treat the transcript API's no-transcript response as conclusive.
                 work_queue.mark_no_transcript(video_id, result)
-                if work_queue.is_video_done(video_id):
-                    status_manager.update_status(thread_slot, f"✗ No transcript (confirmed)")
-                else:
-                    status_manager.update_status(thread_slot, f"? No transcript (needs verification)")
+                status_manager.update_status(thread_slot, "✗ No transcript available")
             else:
                 # Proxy failed - mark it and continue
                 work_queue.mark_proxy_failed(video_id, proxy)
@@ -1528,8 +1521,7 @@ def download_transcripts_parallel(videos: list[dict], source_name: str, source_t
         'completed_ids': list(completed_ids),
         'started_at': datetime.now().isoformat(),
         'completed': not was_interrupted,
-        'mode': 'parallel_collaborative',
-        'proxy_refreshes': work_queue.proxy_refresh_count,
+        'mode': 'parallel_direct_first',
         'output_config': output_config
     }
     save_progress(progress_data)
@@ -1537,125 +1529,7 @@ def download_transcripts_parallel(videos: list[dict], source_name: str, source_t
     print("\n" + "-" * 60)
     print(f"Results: {final_success} success, {final_no_transcript} no transcript, {final_failed} failed")
     print(f"Total proxy attempts: {work_queue.total_proxy_attempts}")
-    print(f"Proxy refreshes used: {work_queue.proxy_refresh_count}/{VideoWorkQueue.MAX_PROXY_REFRESHES}")
-    print(f"Proxies in pool: {len(proxy_pool.proxies)}")
-
-    return videos_data, final_success, was_interrupted
-
-
-def download_transcripts_direct_parallel(videos: list[dict], source_name: str, source_type: str,
-                                         num_threads: int = DEFAULT_THREADS,
-                                         existing_data: list[dict] = None,
-                                         completed_ids: set = None, output_config: dict = None):
-    """
-    Download transcripts directly when no proxies are available.
-    This avoids marking every video failed just because proxy scraping failed.
-    """
-    videos_data = existing_data if existing_data else []
-    completed_ids = completed_ids if completed_ids else set(v['id'] for v in videos_data)
-    total = len(videos)
-    remaining_videos = [v for v in videos if v['id'] not in completed_ids]
-    was_interrupted = False
-
-    if not remaining_videos:
-        print("All videos already processed!")
-        return videos_data, sum(1 for v in videos_data if v.get('transcript')), False
-
-    direct_threads = max(MIN_THREADS, min(num_threads, len(remaining_videos)))
-
-    print(f"\nDownloading transcripts for {total} video(s) [Direct Mode - No Proxies]")
-    print(f"Already completed: {len(completed_ids)}, Remaining: {len(remaining_videos)}")
-    print(f"Using {direct_threads} thread(s)")
-    print("No proxies loaded; trying direct transcript requests.")
-    print("Press Ctrl+C to finish with current results.")
-    print("-" * 60)
-
-    status_manager = ThreadStatusManager(direct_threads, total)
-
-    already_success = sum(1 for v in videos_data if v.get('transcript'))
-    already_no_transcript = sum(1 for v in videos_data if v.get('method') == 'no_transcript')
-    already_failed = len(videos_data) - already_success - already_no_transcript
-    status_manager.update_progress(len(completed_ids), already_success, already_failed, already_no_transcript)
-
-    results_lock = threading.Lock()
-    worker_to_slot = {}
-    next_slot_id = [0]
-
-    def direct_worker(video: dict) -> dict:
-        worker_name = threading.current_thread().name
-        with results_lock:
-            if worker_name not in worker_to_slot:
-                worker_to_slot[worker_name] = next_slot_id[0]
-                next_slot_id[0] += 1
-            thread_slot = worker_to_slot[worker_name]
-
-        title_short = video['title'][:35] + "..." if len(video['title']) > 35 else video['title']
-
-        def update_status(msg):
-            status_manager.update_status(thread_slot, f"{title_short[:25]}... | {msg}")
-
-        update_status("Trying direct...")
-        result = download_single_video_with_proxy(video, None, status_callback=update_status)
-
-        with results_lock:
-            videos_data.append(result)
-            completed_ids.add(result['id'])
-
-            success_count = sum(1 for v in videos_data if v.get('transcript'))
-            no_transcript_count = sum(1 for v in videos_data if v.get('method') == 'no_transcript')
-            failed_count = len(videos_data) - success_count - no_transcript_count
-            status_manager.update_progress(len(completed_ids), success_count, failed_count, no_transcript_count)
-
-            if result.get('transcript'):
-                status_manager.update_status(thread_slot, f"✓ OK ({result['language']}) via direct")
-            elif result.get('method') == 'no_transcript':
-                status_manager.update_status(thread_slot, "✗ No transcript")
-            else:
-                status_manager.update_status(thread_slot, "✗ Direct failed")
-
-        return result
-
-    errors = []
-    try:
-        with status_manager.get_live_context():
-            with ThreadPoolExecutor(max_workers=direct_threads) as executor:
-                futures = [executor.submit(direct_worker, video) for video in remaining_videos]
-                for future in as_completed(futures):
-                    try:
-                        future.result()
-                    except Exception as e:
-                        errors.append(f"Worker error: {e}")
-
-    except KeyboardInterrupt:
-        status_manager.stop_display()
-        print("\n\n** Download interrupted by user **")
-        was_interrupted = True
-
-    status_manager.stop_display()
-
-    final_success = sum(1 for v in videos_data if v.get('transcript'))
-    final_no_transcript = sum(1 for v in videos_data if v.get('method') == 'no_transcript')
-    final_failed = len(videos_data) - final_success - final_no_transcript
-
-    for error_msg in errors:
-        print(error_msg)
-
-    progress_data = {
-        'source_name': source_name,
-        'source_type': source_type,
-        'videos': videos,
-        'current_index': len(completed_ids),
-        'videos_data': videos_data,
-        'completed_ids': list(completed_ids),
-        'started_at': datetime.now().isoformat(),
-        'completed': not was_interrupted,
-        'mode': 'parallel_direct',
-        'output_config': output_config
-    }
-    save_progress(progress_data)
-
-    print("\n" + "-" * 60)
-    print(f"Results: {final_success} success, {final_no_transcript} no transcript, {final_failed} failed")
+    print(f"Proxies in pool: {len(proxy_pool.proxies)} (failed proxies skipped for the rest of this run)")
 
     return videos_data, final_success, was_interrupted
 
@@ -1701,7 +1575,7 @@ def print_header():
     print("   ███       ███    ████████▀ ███████▀ ██████▀  ")
     print()
     print("  YT Bulk Subtitles Downloader")
-    print("  Download subtitles in MD or SRT format")
+    print("  Download subtitles in Markdown, timestamped SRT, or timestamped TXT format")
     print("=" * 50 + "\n")
 
 
@@ -1711,52 +1585,45 @@ def get_user_choice(has_unfinished: bool) -> int:
     print("  [1] Single video transcript")
     print("  [2] All videos from a playlist")
     print("  [3] All videos from a channel")
+    print("  [4] Multiple individual videos (paste URLs or load a .txt file)")
     if has_unfinished:
-        print("  [4] Resume last unfinished job")
+        print("  [5] Resume last unfinished job")
     print("  [0] Exit\n")
 
-    max_choice = 4 if has_unfinished else 3
+    valid_choices = {0, 1, 2, 3, 4}
+    if has_unfinished:
+        valid_choices.add(5)
 
     while True:
         try:
-            choice = int(input(f"Enter your choice (0-{max_choice}): "))
-            if 0 <= choice <= max_choice:
-                if choice == 4 and not has_unfinished:
-                    print("Invalid choice.")
-                    continue
+            choice = int(input("Enter your choice: "))
+            if choice in valid_choices:
                 return choice
-            print(f"Invalid choice. Please enter 0-{max_choice}.")
+            print("Invalid choice. Please choose one of the options shown.")
         except ValueError:
             print("Invalid input. Please enter a number.")
 
 
 def get_threading_choice() -> int:
-    """Ask user for number of threads. Always uses threading."""
-    # Check if proxy file exists
-    if not os.path.exists(PROXY_FILE):
-        print(f"\nWarning: {PROXY_FILE} not found!")
-        print("Create this file with proxy list (IP:PORT per line)")
-        print("Proxies are required since your IP may be rate-limited by YouTube.")
-        return DEFAULT_THREADS
-
-    # Count proxies to set optimal default threads
+    """Ask for a bounded number of concurrent worker threads (not proxies)."""
     proxy_count = 0
     try:
-        with open(PROXY_FILE, 'r') as f:
-            proxy_count = sum(1 for line in f if line.strip() and not line.strip().startswith('#'))
-    except Exception:
+        if os.path.exists(PROXY_FILE):
+            with open(PROXY_FILE, 'r', encoding='utf-8') as f:
+                proxy_count = sum(1 for line in f if line.strip() and not line.strip().startswith('#'))
+    except OSError:
         pass
-    
-    suggested_threads = max(MIN_THREADS, min(proxy_count, MAX_THREADS)) if proxy_count > 0 else DEFAULT_THREADS
 
-    print(f"\nMulti-threaded download mode (using proxies from proxies.txt)")
-    print(f"Loaded {proxy_count} proxies - default {suggested_threads} threads")
+    print("\nParallel download settings")
+    print("  Threads are simultaneous worker tasks, not the number of proxies.")
+    print("  The downloader tries a direct connection first and uses saved proxies only as fallback.")
+    print(f"  Saved proxies available: {proxy_count}")
+    print("  More threads do not make one video download faster and may trigger rate limits.")
 
     while True:
         try:
-            user_input = input(f"Number of threads ({MIN_THREADS}-{MAX_THREADS}, default {suggested_threads}): ")
-            threads = int(user_input) if user_input.strip() else suggested_threads
-            
+            user_input = input(f"Number of threads ({MIN_THREADS}-{MAX_THREADS}, default {DEFAULT_THREADS}): ").strip()
+            threads = int(user_input) if user_input else DEFAULT_THREADS
             if MIN_THREADS <= threads <= MAX_THREADS:
                 return threads
             print(f"Please enter a number between {MIN_THREADS} and {MAX_THREADS}.")
@@ -1774,45 +1641,171 @@ def get_url(mode: str) -> str:
     return input(prompts[mode]).strip()
 
 
+def get_multiple_video_urls() -> list[str]:
+    """Read multiple video URLs from a text file or pasted lines.
+
+    Blank lines and comment lines beginning with # are ignored. Duplicate video IDs
+    are removed while preserving the order of their first occurrence.
+    """
+    print("\nHow would you like to provide the video URLs?\n")
+    print("  [1] Load URLs from a .txt file")
+    print("  [2] Paste URLs, one per line (finish with a blank line)\n")
+
+    while True:
+        method = input("Enter your choice (1-2): ").strip()
+        if method in ("1", "2"):
+            break
+        print("Invalid choice. Please enter 1 or 2.")
+
+    lines = []
+    if method == "1":
+        path = input("Path to the text file: ").strip().strip('"').strip("'")
+        path = os.path.expanduser(path)
+        try:
+            with open(path, "r", encoding="utf-8-sig") as f:
+                lines = f.readlines()
+        except (OSError, UnicodeError) as e:
+            print(f"Could not read URL file: {e}")
+            return []
+    else:
+        print("Paste or type one YouTube video URL per line. Press Enter on an empty line when finished:")
+        while True:
+            try:
+                line = input()
+            except EOFError:
+                break
+            if not line.strip():
+                break
+            lines.append(line)
+
+    urls = []
+    seen_ids = set()
+    invalid_lines = []
+    duplicate_count = 0
+    for raw_line in lines:
+        line = raw_line.strip().strip('"').strip("'")
+        if not line or line.startswith("#"):
+            continue
+        video_id = extract_video_id(line)
+        if not re.fullmatch(r"[a-zA-Z0-9_-]{11}", video_id):
+            invalid_lines.append(line)
+            continue
+        if video_id in seen_ids:
+            duplicate_count += 1
+            continue
+        seen_ids.add(video_id)
+        urls.append(f"https://www.youtube.com/watch?v={video_id}")
+
+    if invalid_lines:
+        print(f"\nSkipped {len(invalid_lines)} invalid line(s). First examples:")
+        for bad_line in invalid_lines[:5]:
+            print(f"  - {bad_line[:120]}")
+        if len(invalid_lines) > 5:
+            print(f"  ... and {len(invalid_lines) - 5} more")
+    if duplicate_count:
+        print(f"Ignored {duplicate_count} duplicate URL(s).")
+    print(f"Loaded {len(urls)} unique video URL(s).")
+    return urls
+
+
+def get_video_metadata_for_url_list(urls: list[str], proxy_pool: ProxyPool) -> list[dict]:
+    """Fetch individual-video metadata concurrently, preserving original URL order."""
+    if not urls:
+        return []
+
+    def fetch_one(url: str) -> dict:
+        base_opts = {
+            'extract_flat': True,
+            'quiet': True,
+            'no_warnings': True,
+        }
+        last_error = None
+        info = None
+
+        # Try direct first; only use a few saved proxies if direct metadata extraction fails.
+        try:
+            info = extract_video_info_with_timeout(url, base_opts, timeout=VIDEO_INFO_TIMEOUT)
+        except Exception as direct_error:
+            last_error = direct_error
+            max_attempts = min(MAX_PROXY_RETRIES, len(proxy_pool.proxies))
+            for _ in range(max_attempts):
+                proxy = proxy_pool.get_proxy()
+                if not proxy:
+                    break
+                proxy_opts = dict(base_opts)
+                proxy_opts['proxy'] = f'http://{proxy}'
+                try:
+                    info = extract_video_info_with_timeout(url, proxy_opts, timeout=VIDEO_INFO_TIMEOUT)
+                    break
+                except Exception as proxy_error:
+                    last_error = proxy_error
+                    proxy_pool.mark_failed(proxy)
+
+        if not info:
+            raise RuntimeError(str(last_error or 'Video metadata could not be fetched').splitlines()[0][:160])
+
+        video_id = info.get('id') or extract_video_id(url)
+        if not re.fullmatch(r'[A-Za-z0-9_-]{11}', str(video_id or '')):
+            raise RuntimeError('YouTube did not return a valid video ID')
+
+        return {
+            'id': video_id,
+            'title': info.get('title', 'Unknown'),
+            'url': video_page_url(url, video_id),
+        }
+
+    results = {}
+    workers = min(DEFAULT_THREADS, len(urls))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(fetch_one, url): (index, url)
+                   for index, url in enumerate(urls)}
+        completed = 0
+        for future in as_completed(futures):
+            index, url = futures[future]
+            completed += 1
+            try:
+                results[index] = future.result()
+                print(f"[{completed}/{len(urls)}] Metadata ready: {results[index].get('title', 'Unknown')[:90]}")
+            except Exception as e:
+                error_detail = str(e).splitlines()[0][:160]
+                # The transcript API can still succeed even when yt-dlp cannot fetch
+                # the title. Preserve the input URL so this video can be attempted and,
+                # if it fails, included in the 00-failed-downloads.txt report.
+                video_id = extract_video_id(url)
+                if re.fullmatch(r'[A-Za-z0-9_-]{11}', str(video_id or '')):
+                    results[index] = {
+                        'id': video_id,
+                        'title': f'Title unavailable ({video_id})',
+                        'url': video_page_url(url, video_id),
+                        'metadata_error': error_detail,
+                    }
+                    print(f"[{completed}/{len(urls)}] Metadata unavailable for {url}; will still try subtitles ({error_detail})")
+                else:
+                    print(f"[{completed}/{len(urls)}] Could not fetch metadata for {url}: {error_detail}")
+
+    # Preserve the order of the user's input even though requests ran concurrently.
+    return [results[index] for index in sorted(results)]
+
+
 def get_channel_content_type() -> str:
     """Ask user what type of content to download from channel."""
-    content_options = {
-        1: ("videos", "Videos only"),
-        2: ("shorts", "Shorts only"),
-        3: ("streams", "Live streams only"),
-        4: ("videos_shorts", "Videos and shorts"),
-        5: ("videos_streams", "Videos and live streams"),
-        6: ("shorts_streams", "Shorts and live streams"),
-        7: ("all", "Videos, shorts, and live streams"),
-    }
-
     print("\nWhat content would you like to download?\n")
-    for number, (_, label) in content_options.items():
-        print(f"  [{number}] {label}")
-    print()
+    print("  [1] Videos only")
+    print("  [2] Shorts only")
+    print("  [3] Both videos and shorts\n")
 
     while True:
         try:
-            choice = int(input("Enter your choice (1-7): "))
-            if choice in content_options:
-                return content_options[choice][0]
-            print("Invalid choice. Please enter a number from 1 to 7.")
+            choice = int(input("Enter your choice (1-3): "))
+            if choice == 1:
+                return "videos"
+            elif choice == 2:
+                return "shorts"
+            elif choice == 3:
+                return "both"
+            print("Invalid choice. Please enter 1, 2, or 3.")
         except ValueError:
             print("Invalid input. Please enter a number.")
-
-
-def get_channel_tabs_for_content_type(content_type: str) -> list[str]:
-    """Return YouTube channel tab suffixes for a selected content type."""
-    content_tabs = {
-        "videos": ["videos"],
-        "shorts": ["shorts"],
-        "streams": ["streams"],
-        "videos_shorts": ["videos", "shorts"],
-        "videos_streams": ["videos", "streams"],
-        "shorts_streams": ["shorts", "streams"],
-        "all": ["videos", "shorts", "streams"],
-    }
-    return content_tabs[content_type]
 
 
 def get_output_config() -> dict:
@@ -1820,25 +1813,29 @@ def get_output_config() -> dict:
     # First ask for format type
     print("\nOutput format:\n")
     print("  [1] Markdown (.md) - All transcripts in single/split files (for LLM RAG)")
-    print("  [2] SRT (.srt) - Separate file per video with timestamps (subtitle format)\n")
+    print("  [2] SRT (.srt) - Separate file per video with timestamps")
+    print("  [3] Plain text (.txt) - Separate transcript file per video\n")
 
     format_type = "markdown"
     while True:
         try:
-            choice = int(input("Enter your choice (1-2): "))
+            choice = int(input("Enter your choice (1-3): "))
             if choice == 1:
                 format_type = "markdown"
                 break
             elif choice == 2:
                 format_type = "srt"
                 break
-            print("Invalid choice. Please enter 1 or 2.")
+            elif choice == 3:
+                format_type = "txt"
+                break
+            print("Invalid choice. Please enter 1, 2, or 3.")
         except ValueError:
             print("Invalid input. Please enter a number.")
 
-    # For SRT format, we always create separate files per video
-    if format_type == "srt":
-        return {'format': 'srt', 'split': True, 'max_words': None}
+    # SRT and TXT formats always create a separate file for each video.
+    if format_type in ("srt", "txt"):
+        return {'format': format_type, 'split': True, 'max_words': None}
 
     # For Markdown, ask about file splitting
     print("\nFile configuration:\n")
@@ -1886,7 +1883,7 @@ def normalize_channel_url(url: str) -> str:
 
 def finalize_output(videos_data: list[dict], source_name: str, source_type: str,
                     success_count: int, was_interrupted: bool, output_config: dict = None) -> bool:
-    """Generate the final output file(s) in the configured format. Returns True to continue to menu, False to exit."""
+    """Generate numbered output file(s), including a source URL at the start of every file."""
     if was_interrupted:
         print("\nPartial results will be saved...")
     else:
@@ -1894,138 +1891,181 @@ def finalize_output(videos_data: list[dict], source_name: str, source_type: str,
 
     output_dir = PROGRESS_DIR
     os.makedirs(output_dir, exist_ok=True)
-
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     filepaths = []
-
-    # Check output format
     output_format = output_config.get('format', 'markdown') if output_config else 'markdown'
+    export_failed_ids = set()
+    report_dir = output_dir
 
     if output_format == 'srt':
-        # Generate SRT files - one per video in a folder
-        filepaths = create_srt_output(videos_data, source_name, output_dir)
+        folder_name = sanitize_filename(source_name) or 'subtitles'
+        report_dir = os.path.join(output_dir, folder_name)
+        filepaths = create_srt_output(videos_data, source_name, output_dir, export_failed_ids)
+    elif output_format == 'txt':
+        folder_name = sanitize_filename(source_name) or 'subtitles'
+        report_dir = os.path.join(output_dir, folder_name)
+        filepaths = create_text_output(videos_data, source_name, output_dir, export_failed_ids)
     elif output_config and output_config.get('split') and output_config.get('max_words'):
-        # Markdown with split by word count
-        folder_name = sanitize_filename(source_name)
+        folder_name = sanitize_filename(source_name) or 'subtitles'
         split_dir = os.path.join(output_dir, folder_name)
+        report_dir = split_dir
         os.makedirs(split_dir, exist_ok=True)
-
-        # Generate split files
         split_files = create_split_markdown_output(
             videos_data, source_name, source_type, output_config['max_words']
         )
-
-        for filename, content in split_files:
-            filename = sanitize_filename(filename) + ".md"
-            filepath = os.path.join(split_dir, filename)
-            with open(filepath, 'w', encoding='utf-8') as f:
+        used_titles = {}
+        for index, (base_title, content) in enumerate(split_files, start=1):
+            filepath = make_numbered_filepath(split_dir, index, base_title, 'md', used_titles)
+            with open(filepath, 'w', encoding='utf-8', newline='') as f:
                 f.write(content)
             filepaths.append(filepath)
     else:
-        # Single markdown file output (original behavior)
         if source_type == "single":
-            filename = f"{source_name}.md"
+            base_title = source_name or 'video'
         elif source_type == "playlist":
-            filename = f"playlist_{source_name}_{timestamp}.md"
+            base_title = f"playlist_{source_name}_{timestamp}"
+        elif source_type == "multiple":
+            base_title = f"multiple_videos_{timestamp}"
         else:
-            filename = f"channel_{source_name}_{timestamp}.md"
+            base_title = f"channel_{source_name}_{timestamp}"
 
-        filename = sanitize_filename(filename)
-        filepath = os.path.join(output_dir, filename)
-
+        filepath = make_numbered_filepath(output_dir, 1, base_title, 'md', {})
         content = create_markdown_output(videos_data, source_name, source_type)
-
-        with open(filepath, 'w', encoding='utf-8') as f:
+        with open(filepath, 'w', encoding='utf-8', newline='') as f:
             f.write(content)
         filepaths.append(filepath)
+
+    report_path, failed_report_count = create_failed_download_report(
+        videos_data, report_dir, export_failed_ids=export_failed_ids
+    )
 
     if not was_interrupted:
         clear_progress()
 
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     if was_interrupted:
         print("  Download Paused (Progress Saved)")
     else:
         print("  Download Complete!")
-    print("="*60)
+    print("=" * 60)
     print(f"\n  Total videos:      {len(videos_data)}")
     print(f"  With transcripts:  {success_count}")
     print(f"  Without:           {len(videos_data) - success_count}")
 
-    if output_format == 'srt':
-        folder_name = sanitize_filename(source_name)
-        srt_dir = os.path.join(output_dir, folder_name)
-        print(f"\n  Output format: SRT (subtitles)")
-        print(f"  Output folder: {srt_dir}")
-        print(f"  SRT files created: {len(filepaths)}")
+    if output_format in ('srt', 'txt'):
+        folder_name = sanitize_filename(source_name) or 'subtitles'
+        output_subdir = os.path.join(output_dir, folder_name)
+        print(f"\n  Output format: {output_format.upper()} (one file per video)")
+        print(f"  Output folder: {output_subdir}")
+        print(f"  Files created: {len(filepaths)}")
     elif len(filepaths) == 1:
         print(f"\n  Output file: {filepaths[0]}")
     else:
         print(f"\n  Output files ({len(filepaths)} parts):")
-        for fp in filepaths[:5]:  # Show first 5
+        for fp in filepaths[:5]:
             print(f"    - {fp}")
         if len(filepaths) > 5:
             print(f"    ... and {len(filepaths) - 5} more")
 
-    if was_interrupted:
-        print(f"\n  To resume: Run the script again and select 'Resume last unfinished job'")
+    print(f"\n  Failure report: {report_path}")
+    if failed_report_count:
+        print(f"  Videos without an exported subtitle file: {failed_report_count}")
+    else:
+        print("  Failed subtitle downloads: 0")
 
-    # Wait for spacebar to return to menu or Q to quit
+    if was_interrupted:
+        print("\n  To resume: Run the script again and select 'Resume last unfinished job'")
+
     return wait_for_spacebar()
 
 
 def run_new_job(mode: str) -> bool:
     """Start a new download job. Returns True to continue to menu, False to exit."""
-    url = get_url(mode)
-    if not url:
-        print("Error: No URL provided.")
-        return True
-
-    if mode == "single":
-        url = f"https://www.youtube.com/watch?v={extract_video_id(url)}"
+    if mode == "multiple":
+        urls = get_multiple_video_urls()
+        if not urls:
+            print("Error: No valid video URLs were provided.")
+            return True
+        url = None
+    else:
+        url = get_url(mode)
+        if not url:
+            print("Error: No URL provided.")
+            return True
+        if mode == "single":
+            url = f"https://www.youtube.com/watch?v={extract_video_id(url)}"
 
     # Initialize proxy pool early for video info fetching
     proxy_pool = ProxyPool(PROXY_FILE, validate=False)
 
+    # Handle a list of independent video URLs.
+    if mode == "multiple":
+        print(f"\nFetching metadata for {len(urls)} video(s)...")
+        videos = get_video_metadata_for_url_list(urls, proxy_pool)
+        # Ensure IDs are unique even if metadata extraction behaved unexpectedly.
+        unique_videos = []
+        seen_ids = set()
+        for video in videos:
+            video_id = video.get("id")
+            if video_id and video_id not in seen_ids:
+                seen_ids.add(video_id)
+                unique_videos.append(video)
+        videos = unique_videos
+        source_name = "multiple_video_transcripts"
+        source_type = "multiple"
+        if not videos:
+            print("No video information could be fetched from the supplied URLs.")
+            return True
+        print(f"\nFound metadata for {len(videos)} video(s)")
+        print(f"Source: {source_name}")
+
     # Handle channel content type selection
-    if mode == "channel":
+    elif mode == "channel":
         # Normalize the URL first (remove any existing /videos, /shorts, etc.)
         url = normalize_channel_url(url)
         content_type = get_channel_content_type()
 
         videos = []
-        seen_video_ids = set()
         source_name = ""
         source_type = "channel"
-        channel_tabs = get_channel_tabs_for_content_type(content_type)
 
-        for tab in channel_tabs:
-            print(f"\nFetching {tab} from channel...")
+        if content_type == "videos":
+            print(f"\nFetching videos from channel...")
             try:
-                tab_videos, tab_source_name, tab_source_type = get_video_ids_from_url(url + f"/{tab}", mode, proxy_pool)
-                added_count = 0
-                for video in tab_videos:
-                    video_id = video.get('id')
-                    if not video_id or video_id in seen_video_ids:
-                        continue
-                    videos.append(video)
-                    seen_video_ids.add(video_id)
-                    added_count += 1
-
-                if tab_source_name and not source_name:
-                    source_name = tab_source_name
-                source_type = tab_source_type
-                print(f"Found {added_count} {tab.replace('_', ' ')} item(s)")
+                videos, source_name, source_type = get_video_ids_from_url(url + "/videos", mode, proxy_pool)
             except Exception as e:
-                if len(channel_tabs) == 1:
-                    print(f"Error fetching {tab} information: {e}")
-                    return True
-                print(f"Warning: Could not fetch {tab}: {e}")
+                print(f"Error fetching video information: {e}")
+                return True
 
-        if not source_name:
-            # Try to extract channel name from URL if we couldn't get it
-            match = re.search(r'@([^/]+)', url)
-            source_name = match.group(1) if match else "channel"
+        elif content_type == "shorts":
+            print(f"\nFetching shorts from channel...")
+            try:
+                videos, source_name, source_type = get_video_ids_from_url(url + "/shorts", mode, proxy_pool)
+            except Exception as e:
+                print(f"Error fetching shorts information: {e}")
+                return True
+
+        else:  # both
+            print(f"\nFetching videos from channel...")
+            try:
+                videos_list, source_name, source_type = get_video_ids_from_url(url + "/videos", mode, proxy_pool)
+                videos.extend(videos_list)
+                print(f"Found {len(videos_list)} video(s)")
+            except Exception as e:
+                print(f"Warning: Could not fetch videos: {e}")
+
+            print(f"\nFetching shorts from channel...")
+            try:
+                shorts_list, _, _ = get_video_ids_from_url(url + "/shorts", mode, proxy_pool)
+                videos.extend(shorts_list)
+                print(f"Found {len(shorts_list)} short(s)")
+            except Exception as e:
+                print(f"Warning: Could not fetch shorts: {e}")
+
+            if not source_name:
+                # Try to extract channel name from URL if we couldn't get it
+                match = re.search(r'@([^/]+)', url)
+                source_name = match.group(1) if match else "channel"
 
         if not videos:
             print("No videos found.")
@@ -2102,8 +2142,15 @@ def main():
     # Ensure subtitles folder exists for saving downloaded transcripts
     os.makedirs(PROGRESS_DIR, exist_ok=True)
 
-    # Download fresh proxies on startup
-    download_fresh_proxies(PROXY_FILE)
+    # Free public proxy scraping is optional: it launches Chrome and can be slow.
+    print("Connection setup: direct connection first; saved proxies are fallback only.")
+    refresh_choice = input("Refresh the free public proxy list now? This may be slow and unreliable. [y/N]: ").strip().lower()
+    if refresh_choice in ("y", "yes"):
+        download_fresh_proxies(PROXY_FILE)
+    elif os.path.exists(PROXY_FILE):
+        print("Using the existing saved proxy list if a fallback is needed.\n")
+    else:
+        print("No saved proxy list; direct connections will be used.\n")
 
     while True:
         print_header()
@@ -2124,10 +2171,10 @@ def main():
             return
 
         continue_to_menu = True
-        if choice == 4:
+        if choice == 5:
             continue_to_menu = resume_job(progress)
         else:
-            mode_map = {1: "single", 2: "playlist", 3: "channel"}
+            mode_map = {1: "single", 2: "playlist", 3: "channel", 4: "multiple"}
             mode = mode_map[choice]
             continue_to_menu = run_new_job(mode)
 
